@@ -57,6 +57,9 @@ struct opus_codec_settings {
 	int minptime;
 	int ptime;
 	int samplerate;
+	/* DRED (Deep Redundancy) parameters for Opus 1.5+ */
+	int ext32_dred_duration;
+	int sprop_ext32_dred_duration;
 };
 typedef struct opus_codec_settings opus_codec_settings_t;
 
@@ -72,7 +75,9 @@ static opus_codec_settings_t default_codec_settings = {
 	/*.maxptime*/ 40,
 	/*.minptime*/ 10,
 	/*.ptime*/ 0,
-	/*.samplerate*/ 0
+	/*.samplerate*/ 0,
+	/*.ext32_dred_duration*/ 0,
+	/*.sprop_ext32_dred_duration*/ 0
 };
 
 static opus_codec_settings_t default_codec_settings_8k = {
@@ -87,7 +92,9 @@ static opus_codec_settings_t default_codec_settings_8k = {
 	/*.maxptime*/ 120,
 	/*.minptime*/ 10,
 	/*.ptime*/ 0,
-	/*.samplerate*/ 0
+	/*.samplerate*/ 0,
+	/*.ext32_dred_duration*/ 0,
+	/*.sprop_ext32_dred_duration*/ 0
 };
 
 static opus_codec_settings_t default_codec_settings_16k = {
@@ -102,7 +109,9 @@ static opus_codec_settings_t default_codec_settings_16k = {
 	/*.maxptime*/ 60,
 	/*.minptime*/ 10,
 	/*.ptime*/ 0,
-	/*.samplerate*/ 0
+	/*.samplerate*/ 0,
+	/*.ext32_dred_duration*/ 0,
+	/*.sprop_ext32_dred_duration*/ 0
 };
 
 struct dec_stats {
@@ -163,6 +172,9 @@ struct {
 	switch_bool_t use_jb_lookahead;
 	switch_mutex_t *mutex;
 	switch_bool_t mono;
+	/* DRED (Deep Redundancy) parameters for Opus 1.5+ */
+	int ext32_dred_duration;
+	int sprop_ext32_dred_duration;
 } opus_prefs;
 
 static struct {
@@ -320,6 +332,23 @@ static switch_status_t switch_opus_fmtp_parse(const char *fmtp, switch_codec_fmt
 							codec_fmtp->actual_samples_per_second = codec_settings->sprop_maxcapturerate;
 						}
 					}
+
+					/* DRED (Deep Redundancy) parameters for Opus 1.5+ */
+					if (!strcasecmp(data, "ext32-dred-duration")) {
+						codec_settings->ext32_dred_duration = atoi(arg);
+						/* Validate DRED duration: must be >= 0 and <= 1000ms (1 second) */
+						if (codec_settings->ext32_dred_duration < 0 || codec_settings->ext32_dred_duration > 1000) {
+							codec_settings->ext32_dred_duration = 0; /* invalid value, ignore */
+						}
+					}
+
+					if (!strcasecmp(data, "sprop-ext32-dred-duration")) {
+						codec_settings->sprop_ext32_dred_duration = atoi(arg);
+						/* Validate DRED duration: must be >= 0 and <= 1000ms (1 second) */
+						if (codec_settings->sprop_ext32_dred_duration < 0 || codec_settings->sprop_ext32_dred_duration > 1000) {
+							codec_settings->sprop_ext32_dred_duration = 0; /* invalid value, ignore */
+						}
+					}
 				}
 			}
 			free(fmtp_dup);
@@ -373,6 +402,15 @@ static char *gen_fmtp(opus_codec_settings_t *settings, switch_memory_pool_t *poo
 
 	if (settings->sprop_stereo) {
 		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "sprop-stereo=%d; ", settings->sprop_stereo);
+	}
+
+	/* DRED (Deep Redundancy) parameters for Opus 1.5+ */
+	if (settings->ext32_dred_duration > 0) {
+		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "ext32-dred-duration=%d; ", settings->ext32_dred_duration);
+	}
+
+	if (settings->sprop_ext32_dred_duration > 0) {
+		snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "sprop-ext32-dred-duration=%d; ", settings->sprop_ext32_dred_duration);
 	}
 
 	if (end_of(buf) == ' ') {
@@ -1055,6 +1093,8 @@ static switch_status_t opus_load_config(switch_bool_t reload)
 	opus_prefs.plpct = 20;
 	opus_prefs.use_vbr = 0;
 	opus_prefs.fec_decode = 1;
+	opus_prefs.ext32_dred_duration = 0;
+	opus_prefs.sprop_ext32_dred_duration = 0;
 
 	if ((settings = switch_xml_child(cfg, "settings"))) {
 		for (param = switch_xml_child(settings, "param"); param; param = param->next) {
@@ -1098,6 +1138,18 @@ static switch_status_t opus_load_config(switch_bool_t reload)
 				}
 			} else if (!strcasecmp(key, "mono")) {
 				opus_prefs.mono = switch_true(val);
+			} else if (!strcasecmp(key, "ext32-dred-duration")) {
+				opus_prefs.ext32_dred_duration = atoi(val);
+				/* Validate DRED duration: must be >= 0 and <= 1000ms (1 second) */
+				if (opus_prefs.ext32_dred_duration < 0 || opus_prefs.ext32_dred_duration > 1000) {
+					opus_prefs.ext32_dred_duration = 0; /* invalid value, ignore */
+				}
+			} else if (!strcasecmp(key, "sprop-ext32-dred-duration")) {
+				opus_prefs.sprop_ext32_dred_duration = atoi(val);
+				/* Validate DRED duration: must be >= 0 and <= 1000ms (1 second) */
+				if (opus_prefs.sprop_ext32_dred_duration < 0 || opus_prefs.sprop_ext32_dred_duration > 1000) {
+					opus_prefs.sprop_ext32_dred_duration = 0; /* invalid value, ignore */
+				}
 			}
 		}
 	}
@@ -1432,6 +1484,14 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opus_load)
 		settings.sprop_maxcapturerate = opus_prefs.sprop_maxcapturerate;
 	}
 
+	if (opus_prefs.ext32_dred_duration) {
+		settings.ext32_dred_duration = opus_prefs.ext32_dred_duration;
+	}
+
+	if (opus_prefs.sprop_ext32_dred_duration) {
+		settings.sprop_ext32_dred_duration = opus_prefs.sprop_ext32_dred_duration;
+	}
+
 	for (x = 0; x < 3; x++) {
 
 		settings.ptime = mss / 1000;
@@ -1508,6 +1568,14 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opus_load)
 	}
 	if (opus_prefs.sprop_maxcapturerate) {
 		settings.sprop_maxcapturerate = opus_prefs.sprop_maxcapturerate;
+	}
+
+	if (opus_prefs.ext32_dred_duration) {
+		settings.ext32_dred_duration = opus_prefs.ext32_dred_duration;
+	}
+
+	if (opus_prefs.sprop_ext32_dred_duration) {
+		settings.sprop_ext32_dred_duration = opus_prefs.sprop_ext32_dred_duration;
 	}
 
 	for (x = 0; x < 3; x++) {
@@ -1605,6 +1673,14 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opus_load)
 	}
 	if (opus_prefs.sprop_maxcapturerate) {
 		settings.sprop_maxcapturerate = opus_prefs.sprop_maxcapturerate;
+	}
+
+	if (opus_prefs.ext32_dred_duration) {
+		settings.ext32_dred_duration = opus_prefs.ext32_dred_duration;
+	}
+
+	if (opus_prefs.sprop_ext32_dred_duration) {
+		settings.sprop_ext32_dred_duration = opus_prefs.sprop_ext32_dred_duration;
 	}
 
 	for (x = 0; x < 3; x++) {
