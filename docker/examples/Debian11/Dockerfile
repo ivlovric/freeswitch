@@ -1,4 +1,4 @@
-FROM debian:bullseye
+FROM debian:bookworm
 MAINTAINER Andrey Volk <andrey@signalwire.com>
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -yq install git
@@ -52,4 +52,5 @@ RUN apt-get clean
 
 # Uncomment to cleanup even more
 #RUN rm -rf /usr/src/*
+
 
