@@ -1,4 +1,4 @@
-FROM debian:bookworm
+FROM debian:trixie
 MAINTAINER Andrey Volk <andrey@signalwire.com>
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -yq install git
@@ -11,7 +11,7 @@ RUN git clone https://github.com/signalwire/signalwire-c /usr/src/libs/signalwir
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get -yq install \
 # build
-    build-essential cmake automake autoconf 'libtool-bin|libtool' pkg-config \
+    build-essential cmake automake autoconf 'libtool-bin|libtool' pkg-config vim glances \
 # general
     libssl-dev zlib1g-dev libdb-dev unixodbc-dev libncurses5-dev libexpat1-dev libgdbm-dev bison erlang-dev libtpl-dev libtiff5-dev uuid-dev \
 # core
@@ -23,7 +23,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -yq install \
 # mod_python3
     python3-dev \
 # mod_av
-    libavformat-dev libswscale-dev libavresample-dev \
+    libavformat-dev libswscale-dev libswresample-dev \
 # mod_lua
     liblua5.2-dev \
 # mod_opus
@@ -47,10 +47,20 @@ RUN cd /usr/src/freeswitch && ./bootstrap.sh -j
 RUN cd /usr/src/freeswitch && ./configure
 RUN cd /usr/src/freeswitch && make -j`nproc` && make install
 
+RUN ln -sf /usr/local/freeswitch/bin/freeswitch /usr/bin/
+RUN ln -sf /usr/local/freeswitch/bin/fs_cli /usr/bin/
+
 # Cleanup the image
 RUN apt-get clean
 
 # Uncomment to cleanup even more
 #RUN rm -rf /usr/src/*
 
+COPY docker-entrypoint.sh healthcheck.sh /
+RUN chmod +x docker-entrypoint.sh
+RUN chmod +x healthcheck.sh
 
+HEALTHCHECK --interval=15s --timeout=5s \
+    CMD  /healthcheck.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
