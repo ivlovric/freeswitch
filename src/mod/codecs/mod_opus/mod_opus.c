@@ -162,11 +162,9 @@ struct opus_context {
 	switch_bool_t recreate_decoder;
 #if OPUS_DRED_AVAILABLE
 	/* DRED (Deep Redundancy) context for Opus 1.5+ */
-	OpusDREDEncoder *dred_encoder;
 	OpusDREDDecoder *dred_decoder;
-	int dred_max_packets;
-	uint8_t *dred_enc_data;
-	int dred_enc_data_len;
+	OpusDRED *dred_state;
+	int dred_max_samples;
 #endif
 };
 
@@ -750,28 +748,14 @@ static switch_status_t switch_opus_init(switch_codec_t *codec, switch_codec_flag
 		}
 
 #if OPUS_DRED_AVAILABLE
-		/* Initialize DRED encoder if DRED duration is configured */
+		/* Configure DRED duration for encoder if specified */
 		if (opus_codec_settings.ext32_dred_duration > 0) {
-			int dred_err;
-			context->dred_max_packets = (opus_codec_settings.ext32_dred_duration + 19) / 20; /* packets for DRED duration */
-			context->dred_encoder = opus_dred_encoder_create(&dred_err);
+			opus_encoder_ctl(context->encoder_object, OPUS_SET_DRED_DURATION(opus_codec_settings.ext32_dred_duration));
+			context->dred_max_samples = opus_codec_settings.ext32_dred_duration * enc_samplerate / 1000;
 
-			if (dred_err == OPUS_OK && context->dred_encoder) {
-				/* Configure DRED encoder */
-				opus_encoder_ctl(context->encoder_object, OPUS_SET_DRED_DURATION(opus_codec_settings.ext32_dred_duration));
-
-				/* Allocate buffer for DRED data */
-				context->dred_enc_data_len = opus_codec_settings.ext32_dred_duration * enc_samplerate / 1000; /* approximate */
-				context->dred_enc_data = switch_core_alloc(codec->memory_pool, context->dred_enc_data_len);
-
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-					"Opus DRED encoder initialized: duration=%dms, max_packets=%d\n",
-					opus_codec_settings.ext32_dred_duration, context->dred_max_packets);
-			} else {
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-					"Failed to create DRED encoder: %s\n", opus_strerror(dred_err));
-				context->dred_encoder = NULL;
-			}
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+				"Opus DRED duration configured: %dms (max_samples=%d)\n",
+				opus_codec_settings.ext32_dred_duration, context->dred_max_samples);
 		}
 #endif
 
@@ -822,12 +806,23 @@ static switch_status_t switch_opus_init(switch_codec_t *codec, switch_codec_flag
 			context->dred_decoder = opus_dred_decoder_create(&dred_err);
 
 			if (dred_err == OPUS_OK && context->dred_decoder) {
-				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
-					"Opus DRED decoder initialized for DRED support\n");
+				/* Also create DRED state for processing */
+				context->dred_state = opus_dred_alloc(&dred_err);
+				if (dred_err != OPUS_OK) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+						"Failed to create DRED state: %s\n", opus_strerror(dred_err));
+					opus_dred_decoder_destroy(context->dred_decoder);
+					context->dred_decoder = NULL;
+					context->dred_state = NULL;
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+						"Opus DRED decoder and state initialized for DRED support\n");
+				}
 			} else {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
 					"Failed to create DRED decoder: %s\n", opus_strerror(dred_err));
 				context->dred_decoder = NULL;
+				context->dred_state = NULL;
 			}
 		}
 #endif
@@ -877,13 +872,13 @@ static switch_status_t switch_opus_destroy(switch_codec_t *codec)
 
 #if OPUS_DRED_AVAILABLE
 		/* Clean up DRED resources */
-		if (context->dred_encoder) {
-			opus_dred_encoder_destroy(context->dred_encoder);
-			context->dred_encoder = NULL;
-		}
 		if (context->dred_decoder) {
 			opus_dred_decoder_destroy(context->dred_decoder);
 			context->dred_decoder = NULL;
+		}
+		if (context->dred_state) {
+			opus_dred_free(context->dred_state);
+			context->dred_state = NULL;
 		}
 #endif
 	}
@@ -915,40 +910,7 @@ static switch_status_t switch_opus_encode(switch_codec_t *codec,
 	}
 
 	if (bytes > 0) {
-#if OPUS_DRED_AVAILABLE
-		/* Add DRED extension if configured and available */
-		if (context->dred_encoder && context->codec_settings.ext32_dred_duration > 0) {
-			int dred_bytes = opus_dred_encode(context->dred_encoder, (void *) decoded_data, context->enc_frame_size,
-				context->dred_enc_data, context->dred_enc_data_len);
-
-			if (dred_bytes > 0) {
-				/* Add DRED extension to the packet using Opus padding mechanism */
-				int total_len = bytes + dred_bytes + 1; /* +1 for padding length byte */
-				if (total_len <= len) {
-					/* Move existing data forward to make room for DRED extension */
-					memmove((unsigned char*)encoded_data + bytes, context->dred_enc_data, dred_bytes);
-					/* Add padding length byte at the end */
-					((unsigned char*)encoded_data)[total_len - 1] = (unsigned char)dred_bytes;
-					*encoded_data_len = (uint32_t) total_len;
-
-					if (globals.debug || context->debug > 1) {
-						switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(codec->session), SWITCH_LOG_DEBUG,
-							"Opus DRED: Added %d bytes of DRED data to packet\n", dred_bytes);
-					}
-				} else {
-					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(codec->session), SWITCH_LOG_WARNING,
-						"Opus DRED: Not enough buffer space for DRED extension\n");
-					*encoded_data_len = (uint32_t) bytes;
-				}
-			} else {
-				*encoded_data_len = (uint32_t) bytes;
-			}
-		} else {
-#endif
-			*encoded_data_len = (uint32_t) bytes;
-#if OPUS_DRED_AVAILABLE
-		}
-#endif
+		*encoded_data_len = (uint32_t) bytes;
 
 		context->encoder_stats.frame_counter++;
 		if (context->enc_frame_size > 0) {
@@ -1021,17 +983,20 @@ static switch_status_t switch_opus_decode(switch_codec_t *codec,
 
 #if OPUS_DRED_AVAILABLE
 	/* Process DRED extension if available and we have a DRED decoder */
-	if (dred_found && context->dred_decoder && dred_data && dred_len > 0) {
-		int dred_ret = opus_dred_parse(context->dred_decoder, dred_data, dred_len, context->dred_max_packets);
-		if (dred_ret == OPUS_OK) {
+	if (dred_found && context->dred_decoder && context->dred_state && dred_data && dred_len > 0) {
+		int dred_end = 0;
+		int dred_offset = opus_dred_parse(context->dred_decoder, context->dred_state, dred_data, dred_len,
+			context->dred_max_samples, codec->implementation->actual_samples_per_second, &dred_end, 0);
+		if (dred_offset >= 0) {
 			if (globals.debug || context->debug > 1) {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(codec->session), SWITCH_LOG_DEBUG,
-					"Opus DRED: Parsed %d bytes of DRED data successfully\n", dred_len);
+					"Opus DRED: Parsed %d bytes of DRED data successfully (offset=%d, end=%d)\n",
+					dred_len, dred_offset, dred_end);
 			}
 		} else {
 			if (globals.debug || context->debug > 1) {
 				switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(codec->session), SWITCH_LOG_DEBUG,
-					"Opus DRED: Failed to parse DRED data: %s\n", opus_strerror(dred_ret));
+					"Opus DRED: Failed to parse DRED data: %s\n", opus_strerror(dred_offset));
 			}
 		}
 		/* Adjust encoded data length to exclude DRED extension for normal decoding */
@@ -1061,8 +1026,9 @@ static switch_status_t switch_opus_decode(switch_codec_t *codec,
 
 #if OPUS_DRED_AVAILABLE
 		/* Try DRED decoding first if DRED decoder is available and has data */
-		if (context->dred_decoder) {
-			int dred_samples = opus_dred_decode(context->dred_decoder, decoded_data, frame_size);
+		if (context->dred_decoder && context->dred_state) {
+			int dred_samples = opus_decoder_dred_decode(context->decoder_object, context->dred_state, 0,
+				(opus_int16*)decoded_data, frame_size);
 			if (dred_samples > 0) {
 				*decoded_data_len = dred_samples * 2 * (!context->codec_settings.sprop_stereo ? codec->implementation->number_of_channels : 2);
 
